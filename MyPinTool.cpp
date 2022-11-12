@@ -7,15 +7,21 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <vector>
 #include "pin.h"
 using std::cerr;
 using std::endl;
 using std::ios;
 using std::ofstream;
 using std::string;
+using std::map;
+using std::set;
+using std::vector;
 using std::hex;
 
 ofstream OutFile;
+ofstream TraceFile;
+ofstream BranchFile;
 bool entryFlag = false;
 ADDRINT entryPoint;
 ADDRINT imageLowAddress;
@@ -24,19 +30,28 @@ string greencat = "webc2-greencat-2";
 
 // make this static to help the compiler optimize our analysis function
 static UINT32 prevIP = 0;
-static std::map<UINT32, std::set<UINT32>> edgeMap;
-static std::set<UINT32> edgeSet;
+static map<UINT32, set<UINT32>> edgeMap;
+static set<UINT32> edgeSet;
+static vector<UINT32> trace;
+static set<UINT32> branches;
 
 // This function is called before every instruction is executed
-VOID docount(UINT32 ip) {
+VOID analyse(UINT32 ip, bool isConditionalBranch) {
+    trace.push_back(prevIP);
+
     ip = ip - imageLowAddress;
+
+    if (isConditionalBranch) {
+        branches.insert(ip);
+    }
+
     if (prevIP != ip) {
         auto search = edgeMap.find(prevIP);
         if (search != edgeMap.end()) {
             search->second.insert(ip);
         }
         else {
-            std::set<ADDRINT> edgeSetLocal;
+            set<ADDRINT> edgeSetLocal;
             edgeSetLocal.insert(ip);
             edgeMap[prevIP] = edgeSetLocal;
         }
@@ -55,8 +70,10 @@ VOID Instruction(INS ins, VOID* v)
     if (entryFlag) {
         if (instAddress >= imageLowAddress && instAddress <= imageHighAddress) {
             // Insert a call to docount on every instruction after entrypoint is passed, 
-            // instruction pointer is passed as argument
-            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)docount, IARG_INST_PTR, IARG_END);
+            // instruction pointer is passed as argument, 
+            // along with whether it is conditional or not, for CDG analysis
+            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)analyse, IARG_INST_PTR, 
+                IARG_BOOL, (INS_IsBranch(ins) && INS_HasFallThrough(ins)), IARG_END);
         }
     }
 }
@@ -75,12 +92,16 @@ VOID Image(IMG img, VOID* v) {
     }
 }
 
-KNOB< string > KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "inscount.out", "specify output file name");
+KNOB< string > KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "cfg.dot", "specify output file name");
+KNOB< string > KnobTraceFile(KNOB_MODE_WRITEONCE, "pintool", "t", "trace.txt", "specify trace file name");
+KNOB< string > KnobBranchFile(KNOB_MODE_WRITEONCE, "pintool", "b", "branches.txt", "specify branch file name");
 
 // This function is called when the application exits
 VOID Fini(INT32 code, VOID* v)
 {
-    // Write to a file since cout and cerr maybe closed by the application
+    // Writing to a file since cout and cerr maybe closed by the application
+    // Write the CFG to a dotfile
+    OutFile.setf(ios::showbase);
     OutFile << "digraph {\n";
     for (auto& edgesFrom : edgeMap) {
         for (auto& edgeTo : edgesFrom.second) {
@@ -89,6 +110,20 @@ VOID Fini(INT32 code, VOID* v)
     }
     OutFile << "}";
     OutFile.close();
+
+    // Write to trace file
+    TraceFile.setf(ios::showbase);
+    for (auto& instr : trace) {
+        TraceFile << hex << instr << "\n";
+    }
+    TraceFile.close();
+
+    // Write to branch file
+    BranchFile.setf(ios::showbase);
+    for (auto& instr : branches) {
+        BranchFile << hex << instr << "\n";
+    }
+    BranchFile.close();
 }
 
 /* ===================================================================== */
@@ -116,7 +151,8 @@ int main(int argc, char* argv[])
     if (PIN_Init(argc, argv)) return Usage();
 
     OutFile.open(KnobOutputFile.Value().c_str());
-    OutFile.setf(ios::showbase);
+    TraceFile.open(KnobTraceFile.Value().c_str());
+    BranchFile.open(KnobBranchFile.Value().c_str());
 
     // Register Image to be called to instrument the image - to get address of WinMain
     IMG_AddInstrumentFunction(Image, 0);
